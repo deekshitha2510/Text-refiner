@@ -1,0 +1,1 @@
+web: python -m nltk.downloader punkt averaged_perceptron_tagger wordnet omw-1.4 words && gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 120 app:app
