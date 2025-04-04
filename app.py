@@ -1,3 +1,4 @@
+import os
 from flask import Flask, render_template, request, jsonify
 import nltk
 from nltk.tokenize import word_tokenize, sent_tokenize
@@ -8,9 +9,15 @@ import re
 from textblob import TextBlob
 from textblob import Word
 from flask_cors import CORS 
+import logging
 
+# Initialize Flask app
 app = Flask(__name__)
-CORS(app) 
+CORS(app)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class GrammarChecker:
     def __init__(self):
@@ -26,6 +33,7 @@ class GrammarChecker:
             'IN': 'Preposition',
             'CC': 'Conjunction'
         }
+        self.common_words = set(nltk.corpus.words.words()) if hasattr(nltk.corpus, 'words') else set()
     
     def _download_nltk_resources(self):
         resources = [
@@ -38,71 +46,69 @@ class GrammarChecker:
         for resource, package in resources:
             try:
                 nltk.data.find(f'{package}/{resource}')
+                logger.info(f"NLTK resource {resource} already available")
             except LookupError:
-                nltk.download(resource)
+                logger.info(f"Downloading NLTK resource {resource}")
+                nltk.download(resource, quiet=True)
     
-    def mark_grammar_errors(self, text):
-        sentences = sent_tokenize(text)
-        results = []
-        
-        for sentence in sentences:
-            tokens = word_tokenize(sentence)
-            tagged = pos_tag(tokens)
+    def mark_grammar_errors(self, text, max_length=1000):
+        if len(text) > max_length:
+            raise ValueError(f"Text exceeds maximum length of {max_length} characters")
             
-            analysis = []
-            for word, tag in tagged:
-                pos = self.grammar_rules.get(tag[:2], 'Other')
-                spelling_issues = self._check_spelling(word)
-                analysis.append({
-                    'word': word,
-                    'pos': pos,
-                    'tag': tag,
-                    'spelling_issues': spelling_issues
+        try:
+            sentences = sent_tokenize(text)
+            results = []
+            
+            for sentence in sentences:
+                tokens = word_tokenize(sentence)
+                tagged = pos_tag(tokens)
+                
+                analysis = []
+                for word, tag in tagged:
+                    pos = self.grammar_rules.get(tag[:2], 'Other')
+                    spelling_issues = self._check_spelling(word)
+                    analysis.append({
+                        'word': word,
+                        'pos': pos,
+                        'tag': tag,
+                        'spelling_issues': spelling_issues
+                    })
+                
+                results.append({
+                    'sentence': sentence,
+                    'analysis': analysis
                 })
             
-            results.append({
-                'sentence': sentence,
-                'analysis': analysis
-            })
-        
-        return {
-            'original_text': text,
-            'analysis': results,
-            'summary': self._generate_summary(results)
-        }
+            return {
+                'original_text': text,
+                'analysis': results,
+                'summary': self._generate_summary(results)
+            }
+        except Exception as e:
+            logger.error(f"Error in mark_grammar_errors: {str(e)}")
+            raise
     
     def _check_spelling(self, word):
-        # Skip non-alphabetic words or very short words
         if not word.isalpha() or len(word) <= 1:
             return None
             
-        # Skip proper nouns (capitalized words)
         if word[0].isupper():
             return None
             
-        # Check against NLTK words corpus
-        try:
-            from nltk.corpus import words as nltk_words
-            if word.lower() in nltk_words.words():
-                return None
-        except:
-            pass
+        if word.lower() in self.common_words:
+            return None
             
-        # Check against WordNet
         if wordnet.synsets(word.lower()):
             return None
             
-        # Use TextBlob for spelling correction
         word_obj = Word(word.lower())
         suggestions = word_obj.spellcheck()
         
-        if suggestions and suggestions[0][0].lower() != word.lower():
-            # If the top suggestion is different and confidence is reasonable
-            if suggestions[0][1] > 0.7:  # Increased confidence threshold
-                return {
-                    'incorrect': True,
-                    'suggestions': [s[0] for s in suggestions[:3] if s[0].lower() != word.lower()]
-                }
+        if suggestions and suggestions[0][0].lower() != word.lower() and suggestions[0][1] > 0.7:
+            return {
+                'incorrect': True,
+                'suggestions': [s[0] for s in suggestions[:3] if s[0].lower() != word.lower()]
+            }
         return None
     
     def _generate_summary(self, analysis):
@@ -111,26 +117,29 @@ class GrammarChecker:
         for sentence in analysis:
             for word in sentence['analysis']:
                 pos_counts[word['pos']] += 1
-                if word['spelling_issues'] and word['spelling_issues']['incorrect']:
+                if word.get('spelling_issues', {}).get('incorrect'):
                     spelling_errors += 1
         
-        summary = dict(pos_counts)
-        summary['spelling_errors'] = spelling_errors
-        return summary
+        return {
+            'parts_of_speech': dict(pos_counts),
+            'spelling_errors': spelling_errors,
+            'total_sentences': len(analysis),
+            'total_words': sum(len(s['analysis']) for s in analysis)
+        }
 
 class PlainEnglishParaphraser:
     def __init__(self):
         self._download_nltk_resources()
         self.phrase_replacements = {
-            'in spite of the fact that': 'although',
-            'at this point in time': 'now',
-            'the majority of': 'most',
-            'are in agreement': 'agree',
-            'not too distant future': 'soon',
-            'may be eliminated altogether': 'may be cut',
-            'there is a solemn danger': 'there is a risk',
-            'professional nurses': 'school nurses',
-            'are essential': 'are needed'
+            r'in\s+spite\s+of\s+the\s+fact\s+that': 'although',
+            r'at\s+this\s+point\s+in\s+time': 'now',
+            r'the\s+majority\s+of': 'most',
+            r'are\s+in\s+agreement': 'agree',
+            r'not\s+too\s+distant\s+future': 'soon',
+            r'may\s+be\s+eliminated\s+altogether': 'may be cut',
+            r'there\s+is\s+a\s+solemn\s+danger': 'there is a risk',
+            r'professional\s+nurses': 'school nurses',
+            r'are\s+essential': 'are needed'
         }
         self.word_replacements = {
             'solemn': 'serious',
@@ -150,18 +159,17 @@ class PlainEnglishParaphraser:
             ('averaged_perceptron_tagger', 'taggers'),
             ('punkt', 'tokenizers'),
             ('wordnet', 'corpora'),
-            ('omw-1.4', 'corpora'),
-            ('words', 'corpora')
+            ('omw-1.4', 'corpora')
         ]
         for resource, package in resources:
             try:
                 nltk.data.find(f'{package}/{resource}')
             except LookupError:
-                nltk.download(resource)
+                nltk.download(resource, quiet=True)
     
     def _simplify_phrase(self, text):
         for phrase, replacement in self.phrase_replacements.items():
-            text = re.sub(re.escape(phrase), replacement, text, flags=re.IGNORECASE)
+            text = re.sub(phrase, replacement, text, flags=re.IGNORECASE)
         return text
     
     def _simplify_words(self, text):
@@ -171,9 +179,7 @@ class PlainEnglishParaphraser:
             lower_word = word.lower()
             if lower_word in self.word_replacements:
                 replacement = self.word_replacements[lower_word]
-                if word.istitle():
-                    replacement = replacement.title()
-                simplified.append(replacement)
+                simplified.append(replacement.capitalize() if word.istitle() else replacement)
             else:
                 simplified.append(word)
         return ' '.join(simplified)
@@ -181,39 +187,36 @@ class PlainEnglishParaphraser:
     def _improve_punctuation(self, text):
         text = re.sub(r'\s([,.!?;])', r'\1', text)
         text = re.sub(r',\s*and', ' and', text)
-        text = re.sub(r'\s+', ' ', text)
-        text = re.sub(r'\.\s+\.', '.', text)
-        return text.strip()
-    
-    def _correct_spelling(self, text):
-        blob = TextBlob(text)
-        corrected = str(blob.correct())
-        # Additional check to ensure we don't make things worse
-        if len(word_tokenize(text)) == len(word_tokenize(corrected)):
-            return corrected
+        text = re.sub(r'\s+', ' ', text).strip()
         return text
     
-    def paraphrase(self, text):
-        simplified = self._simplify_phrase(text)
-        simplified = self._simplify_words(simplified)
-        simplified = self._improve_punctuation(simplified)
-        simplified = self._correct_spelling(simplified)
-        
-        return {
-            'original': text,
-            'paraphrased': simplified,
-            'improvement_percentage': self._calculate_improvement(text, simplified)
-        }
+    def paraphrase(self, text, max_length=1000):
+        if len(text) > max_length:
+            raise ValueError(f"Text exceeds maximum length of {max_length} characters")
+            
+        try:
+            simplified = self._simplify_phrase(text)
+            simplified = self._simplify_words(simplified)
+            simplified = self._improve_punctuation(simplified)
+            
+            return {
+                'original': text,
+                'paraphrased': simplified,
+                'improvement_percentage': self._calculate_improvement(text, simplified)
+            }
+        except Exception as e:
+            logger.error(f"Error in paraphrase: {str(e)}")
+            raise
     
     def _calculate_improvement(self, original, paraphrased):
-        orig_words = word_tokenize(original)
-        para_words = word_tokenize(paraphrased)
+        orig_words = word_tokenize(original.lower())
+        para_words = word_tokenize(paraphrased.lower())
         
-        orig_complex = sum(1 for word in orig_words if word.lower() in self.word_replacements or 
-                          any(phrase.lower() in original.lower() for phrase in self.phrase_replacements))
+        orig_complex = sum(1 for word in orig_words if word in self.word_replacements or 
+                          any(re.search(phrase, original.lower()) for phrase in self.phrase_replacements))
         
-        para_complex = sum(1 for word in para_words if word.lower() in self.word_replacements or 
-                          any(phrase.lower() in paraphrased.lower() for phrase in self.phrase_replacements))
+        para_complex = sum(1 for word in para_words if word in self.word_replacements or 
+                          any(re.search(phrase, paraphrased.lower()) for phrase in self.phrase_replacements))
         
         if orig_complex == 0:
             return 100
@@ -221,48 +224,59 @@ class PlainEnglishParaphraser:
         improvement = ((orig_complex - para_complex) / orig_complex) * 100
         return max(0, min(100, round(improvement)))
 
+# Initialize components
 grammar_checker = GrammarChecker()
 paraphraser = PlainEnglishParaphraser()
 
 @app.route('/')
-def index():
-    return render_template('index.html')
+def home():
+    return jsonify({
+        'status': 'active',
+        'endpoints': {
+            '/analyze_grammar': 'POST with {"text": "your text"}',
+            '/paraphrase': 'POST with {"text": "your text"}'
+        }
+    })
 
 @app.route('/analyze_grammar', methods=['POST'])
 def analyze_grammar():
     try:
-        if request.is_json:
-            data = request.get_json()
-            text = data.get('text', '')
-        else:
-            text = request.form.get('text', '')
+        data = request.get_json()
+        if not data or 'text' not in data:
+            return jsonify({'error': 'Missing text parameter'}), 400
             
+        text = data['text'].strip()
         if not text:
-            return jsonify({'error': 'No text provided'}), 400
+            return jsonify({'error': 'Text cannot be empty'}), 400
             
         result = grammar_checker.mark_grammar_errors(text)
         return jsonify(result)
         
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Grammar analysis error: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
 
 @app.route('/paraphrase', methods=['POST'])
 def paraphrase_text():
     try:
-        if request.is_json:
-            data = request.get_json()
-            text = data.get('text', '')
-        else:
-            text = request.form.get('text', '')
+        data = request.get_json()
+        if not data or 'text' not in data:
+            return jsonify({'error': 'Missing text parameter'}), 400
             
+        text = data['text'].strip()
         if not text:
-            return jsonify({'error': 'No text provided'}), 400
+            return jsonify({'error': 'Text cannot be empty'}), 400
             
         result = paraphraser.paraphrase(text)
         return jsonify(result)
         
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Paraphrasing error: {str(e)}")
+        return jsonify({'error': 'Internal server error'}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
